@@ -146,13 +146,16 @@ class ConsistencyEvaluation(Evaluation):
             if col not in self.synthetic_data.columns:
                 continue
 
-            vals = self.synthetic_data[col]
-            violation_mask = np.zeros(n_synth, dtype=bool)
+            raw = self.synthetic_data[col]
+            # A column that arrives as text must not abort the whole dimension:
+            # values that are not numbers cannot satisfy a numeric bound.
+            vals = pd.to_numeric(raw, errors="coerce")
+            violation_mask = (vals.isna() & raw.notna()).to_numpy()
 
             if col_min is not None:
-                violation_mask |= (vals < col_min).values
+                violation_mask |= (vals < col_min).to_numpy()
             if col_max is not None:
-                violation_mask |= (vals > col_max).values
+                violation_mask |= (vals > col_max).to_numpy()
 
             rate = round(float(violation_mask.sum()) / n_synth, 4)
             results[f"{col} [{col_min}, {col_max}]"] = rate

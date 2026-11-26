@@ -321,6 +321,35 @@ def preprocess_and_split(config: RunConfig):
     )
 
 
+def align_numeric_dtypes(
+    synthetic_df: pd.DataFrame,
+    train_df: pd.DataFrame,
+    categorical_cols: list = None,
+) -> pd.DataFrame:
+    """Convert columns that are numeric in the training data back to numbers.
+
+    Some generators return numeric columns as strings (for example decoded
+    category bins). Downstream evaluators compare those columns with numeric
+    bounds, so a text column would make a whole dimension fail. Values that
+    cannot be converted become NaN and are reported.
+    """
+    categorical = set(categorical_cols or [])
+    aligned = synthetic_df.copy()
+    for col in aligned.columns:
+        if col in categorical or col not in train_df.columns:
+            continue
+        if not pd.api.types.is_numeric_dtype(train_df[col]):
+            continue
+        if pd.api.types.is_numeric_dtype(aligned[col]):
+            continue
+        converted = pd.to_numeric(aligned[col], errors="coerce")
+        lost = int(converted.isna().sum() - aligned[col].isna().sum())
+        if lost:
+            print(f"WARNING: {lost} non-numeric values in '{col}' became NaN")
+        aligned[col] = converted
+    return aligned
+
+
 def save_synthetic(
     synthetic_df: pd.DataFrame,
     train_df: pd.DataFrame,
@@ -340,7 +369,9 @@ def save_synthetic(
 
     shared_cols = [c for c in train_df.columns if c in synthetic_df.columns]
 
-    synthetic_df = synthetic_df[shared_cols]
+    synthetic_df = align_numeric_dtypes(
+        synthetic_df[shared_cols], train_df, categorical_cols
+    )
 
     os.makedirs(
         paths["synthetic_dir"],

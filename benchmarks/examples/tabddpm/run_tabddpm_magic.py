@@ -44,9 +44,9 @@ config = RunConfig(
 def main():
     if not _TABDDPM_EXTERNAL:
         warnings.warn(
-            "The local TabDDPM fallback rounds categorical predictions in its loss, "
-            "yielding zero feature-learning gradients. Use the full TabDDPM backend "
-            "for meaningful categorical benchmark results.",
+            "Using the compact local TabDDPM diffusion (the reference tabddpm "
+            "package is not installed). Results are indicative, not a "
+            "reproduction of the published TabDDPM.",
             RuntimeWarning,
             stacklevel=2,
         )

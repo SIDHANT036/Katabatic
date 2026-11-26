@@ -29,10 +29,10 @@ class _ARFEngine:
     1. Generate naive synthetic data by independently sampling each column
        from its empirical marginal distribution (real data).
     2. Train a Random Forest to classify real (1) vs synthetic (0).
-    3. Replace synthetic data with leaf-conditional samples: for each
-       synthetic point, find real rows that land in the same leaf for at
-       least `leaf_thresh` fraction of trees (majority vote), then sample
-       one of them per feature.
+    3. Replace synthetic data with leaf-conditional samples: pick a tree and
+       a leaf (weighted by the real rows it holds), then draw each feature
+       from the real rows in that leaf. `leaf_thresh` is kept for backward
+       compatibility and is no longer used.
     4. Repeat 2-3 until OOB accuracy <= 0.5 + delta, or max_iters is
        reached.
 
@@ -266,54 +266,42 @@ class _ARFEngine:
         rng: np.random.Generator,
     ) -> np.ndarray:
         """
-        Majority-vote leaf matching.
+        Leaf-conditional sampling (the "forge" step of an ARF).
 
-        For each synthetic point, count how many trees place each real row
-        in the same leaf. Any real row agreeing on >= leaf_thresh fraction
-        of trees is a candidate neighbour. We then sample one candidate
-        independently per feature.
+        Each output row picks a tree at random and a leaf of that tree with
+        probability proportional to the real rows it holds (by taking the leaf
+        of a random real row). Every feature is then drawn independently from
+        the real rows in that leaf. The discriminator splits wherever real and
+        synthetic data differ, so features inside a leaf are close to
+        independent and the dependence between columns, including the label,
+        is kept by the choice of leaf.
 
-        This is more robust than requiring all-tree agreement, which can
-        fail silently on larger or higher-dimensional datasets.
+        ``X_synth_enc`` only fixes how many rows to generate.
         """
-        real_leaves = rf.apply(X_real_enc)
-        synth_leaves = rf.apply(X_synth_enc)
-
-        n_trees = real_leaves.shape[1]
-        threshold = int(np.ceil(self.leaf_thresh * n_trees))
-
         n_synth, n_features = X_synth_enc.shape
-        X_new = np.empty_like(X_synth_enc)
+        real_leaves = rf.apply(X_real_enc)
+        n_real, n_trees = real_leaves.shape
 
-        for s_idx in range(n_synth):
-            agreement = np.sum(
-                real_leaves == synth_leaves[s_idx],
-                axis=1,
-            )
+        trees = rng.integers(0, n_trees, size=n_synth)
+        anchors = rng.integers(0, n_real, size=n_synth)
+        columns = np.arange(n_features)
+        X_new = np.empty((n_synth, n_features), dtype=float)
 
-            candidate_idx = np.where(agreement >= threshold)[0]
+        for tree in np.unique(trees):
+            rows = np.where(trees == tree)[0]
+            leaf_of_real = real_leaves[:, tree]
+            order = np.argsort(leaf_of_real, kind="stable")
+            sorted_leaves = leaf_of_real[order]
 
-            if len(candidate_idx) == 0:
-                top_k = max(
-                    1,
-                    int(0.1 * len(X_real_enc)),
-                )
+            chosen_leaf = leaf_of_real[anchors[rows]]
+            starts = np.searchsorted(sorted_leaves, chosen_leaf, side="left")
+            counts = np.searchsorted(sorted_leaves, chosen_leaf, side="right") - starts
 
-                candidate_idx = np.argpartition(
-                    agreement,
-                    -top_k,
-                )[-top_k:]
-
-            chosen = rng.choice(
-                candidate_idx,
-                size=n_features,
-                replace=True,
-            )
-
-            X_new[s_idx] = X_real_enc[
-                chosen,
-                np.arange(n_features),
-            ]
+            offsets = np.floor(
+                rng.random((len(rows), n_features)) * counts[:, None]
+            ).astype(int)
+            members = order[starts[:, None] + offsets]
+            X_new[rows] = X_real_enc[members, columns[None, :]]
 
         return X_new
 

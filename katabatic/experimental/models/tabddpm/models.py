@@ -416,14 +416,11 @@ class Tabddpm(Model):
             self._class_dist = None
 
         # ---- build denoiser (MLP) + diffusion wrapper ----
-        # Input dim for denoiser differs between external and fallback implementations.
-        if _TABDDPM_EXTERNAL:
-            d_in = (
-                0 if self._K.size == 1 and self._K[0] == 0 else int(self._K.sum())
-            ) + self._n_num
-        else:
-            # Fallback uses concatenated [numerical | categorical indices] directly
-            d_in = self._n_num + len(self._feature_names_cat)
+        # Both the external package and the local fallback denoise numerical
+        # columns plus one-hot categorical blocks.
+        d_in = (
+            0 if self._K.size == 1 and self._K[0] == 0 else int(self._K.sum())
+        ) + self._n_num
         is_y_cond = True  # follow your training script
         num_classes = len(np.unique(y_enc)) if self._is_classification else 0
 
