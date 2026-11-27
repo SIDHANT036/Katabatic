@@ -41,9 +41,23 @@ class ColumnMeta:
     qt: QuantileTransformer | None = None
 
 
-def infer_schema(df: pd.DataFrame) -> list[ColumnMeta]:
+def infer_schema(
+    df: pd.DataFrame,
+    categorical_cols: list[str] | None = None,
+    continuous_cols: list[str] | None = None,
+) -> list[ColumnMeta]:
+    """Build the column schema.
+
+    Columns named in ``categorical_cols`` or ``continuous_cols`` use that type;
+    every other column (for example the label) falls back to the dtype and
+    cardinality heuristic.
+    """
     schema: list[ColumnMeta] = []
-    cat_cols = set(infer_categorical_columns(df))
+    declared_cat = set(categorical_cols or [])
+    declared_cont = set(continuous_cols or [])
+    cat_cols = (set(infer_categorical_columns(df)) - declared_cont) | (
+        declared_cat & set(df.columns)
+    )
     for c in df.columns:
         if c in cat_cols:
             cats = sorted([str(v) for v in df[c].dropna().unique().tolist()])
@@ -51,6 +65,11 @@ def infer_schema(df: pd.DataFrame) -> list[ColumnMeta]:
         else:
             schema.append(ColumnMeta(name=c, kind="continuous"))
     return schema
+
+
+# Quantile-normal values are clipped to +/-CONT_SCALE and divided by it so they
+# fit the generator's tanh output range of (-1, 1).
+CONT_SCALE = 3.0
 
 
 def fit_transformers(df: pd.DataFrame, schema: list[ColumnMeta]) -> None:
@@ -85,7 +104,8 @@ def encode_df(
         if col.kind == "continuous":
             vals = df[[col.name]].astype(float).values
             if col.qt is not None:
-                vals = col.qt.transform(vals)
+                vals = np.clip(col.qt.transform(vals), -CONT_SCALE, CONT_SCALE)
+                vals = vals / CONT_SCALE
             arrays.append(vals.astype(np.float32))
         else:
             cats = col.categories or []
@@ -109,27 +129,27 @@ def encode_df(
 
 
 def decode_batch(enc: np.ndarray, schema: list[ColumnMeta]) -> pd.DataFrame:
-    rows: list[dict[str, object]] = []
-    col_ptr = 0
-    for i in range(enc.shape[0]):
-        row: dict[str, object] = {}
-        col_ptr = 0
-        for col in schema:
-            if col.kind == "continuous":
-                val = float(enc[i, col_ptr])
-                if col.qt is not None:
-                    val = float(col.qt.inverse_transform(np.array([[val]]))[0, 0])
-                row[col.name] = val
-                col_ptr += 1
+    """Decode generator output back to the original columns (vectorised)."""
+    data: dict[str, object] = {}
+    ptr = 0
+    for col in schema:
+        if col.kind == "continuous":
+            vals = enc[:, ptr].astype(float)
+            ptr += 1
+            if col.qt is not None:
+                vals = col.qt.inverse_transform((vals * CONT_SCALE).reshape(-1, 1))
+                vals = vals.ravel()
+            data[col.name] = vals
+        else:
+            cats = col.categories or []
+            size = len(cats)
+            if size == 0:
+                data[col.name] = np.full(enc.shape[0], None, dtype=object)
             else:
-                size = len(col.categories or [])
-                block = enc[i, col_ptr : col_ptr + size]
-                idx = int(np.argmax(block)) if size > 0 else -1
-                cats = col.categories or []
-                row[col.name] = cats[idx] if 0 <= idx < len(cats) else None
-                col_ptr += size
-        rows.append(row)
-    return pd.DataFrame(rows)
+                idx = np.argmax(enc[:, ptr : ptr + size], axis=1)
+                data[col.name] = np.asarray(cats, dtype=object)[idx]
+            ptr += size
+    return pd.DataFrame(data, columns=[c.name for c in schema])
 
 
 def build_conditioning(
@@ -192,3 +212,61 @@ def sample_conditions(
             k = int(np.random.randint(dim))
         conds[i, start + k] = 1.0
     return conds.astype(np.float32)
+
+
+class ConditionSampler:
+    """Training-by-sampling: a condition and real rows that satisfy it.
+
+    Each draw picks one categorical column uniformly, a category from that
+    column's empirical distribution, and a real row holding that category. The
+    real batch and the generator therefore see the same single one-hot
+    condition, so the discriminator cannot tell them apart by its shape.
+    """
+
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        schema: list[ColumnMeta],
+        cond_blocks: dict[str, tuple[int, int]],
+        empirical_probs: dict[str, np.ndarray],
+    ) -> None:
+        self.cols = [c for c in schema if c.kind == "categorical" and c.categories]
+        self.cond_blocks = cond_blocks
+        self.cond_dim = int(sum(len(c.categories) for c in self.cols))
+        self.probs = []
+        self.order = []
+        self.starts = []
+        self.counts = []
+        for col in self.cols:
+            cat_to_idx = {v: i for i, v in enumerate(col.categories)}
+            codes = df[col.name].astype(str).map(lambda v: cat_to_idx.get(v, -1))
+            codes = codes.to_numpy()
+            order = np.argsort(codes, kind="stable")
+            k = len(col.categories)
+            counts = np.bincount(codes[codes >= 0], minlength=k)
+            starts = np.concatenate([[0], np.cumsum(counts)[:-1]]) + int(
+                (codes < 0).sum()
+            )
+            p = np.asarray(empirical_probs[col.name], dtype=float) * (counts > 0)
+            self.probs.append(p / p.sum())
+            self.order.append(order)
+            self.starts.append(starts)
+            self.counts.append(counts)
+
+    def sample(self, n: int, rng: np.random.Generator):
+        """Return (cond, row_idx, col_idx, cat_idx) for ``n`` draws."""
+        col_idx = rng.integers(len(self.cols), size=n)
+        cat_idx = np.zeros(n, dtype=int)
+        row_idx = np.zeros(n, dtype=int)
+        cond = np.zeros((n, self.cond_dim), dtype=np.float32)
+        for j, col in enumerate(self.cols):
+            rows = np.where(col_idx == j)[0]
+            if len(rows) == 0:
+                continue
+            cats = rng.choice(len(self.probs[j]), size=len(rows), p=self.probs[j])
+            offset = np.floor(rng.random(len(rows)) * self.counts[j][cats]).astype(int)
+            row_idx[rows] = self.order[j][self.starts[j][cats] + offset]
+            cat_idx[rows] = cats
+            start, _ = self.cond_blocks[col.name]
+            cond[rows, start + cats] = 1.0
+        return cond, row_idx, col_idx, cat_idx

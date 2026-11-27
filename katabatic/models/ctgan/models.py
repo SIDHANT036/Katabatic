@@ -15,6 +15,7 @@ from katabatic.models.base_model import Model as BaseModel
 
 from .utils import (
     ColumnMeta,
+    ConditionSampler,
     build_conditioning,
     decode_batch,
     encode_df,
@@ -57,7 +58,7 @@ class CTGANModel(BaseModel):
         lr: float = 2e-4,
         betas: tuple[float, float] = (0.5, 0.9),
         lambda_gp: float = 10.0,
-        use_gradient_penalty: bool = False,
+        use_gradient_penalty: bool = True,
         clip_value: float = 0.01,
         n_critic: int = 5,
         gumbel_tau: float = 0.2,
@@ -229,6 +230,8 @@ class CTGANModel(BaseModel):
         self,
         X: pd.DataFrame,
         y: pd.Series | None = None,
+        categorical_cols: list[str] | None = None,
+        continuous_cols: list[str] | None = None,
     ) -> CTGANModel:
         """
         Fit CTGAN on in-memory data.
@@ -240,6 +243,9 @@ class CTGANModel(BaseModel):
             frame with the label as its last column (as CTGAN.train() builds it).
         y : Series, optional
             Label column to concatenate onto `X` before fitting.
+        categorical_cols, continuous_cols : list of str, optional
+            Declare column types. Undeclared columns (such as the label) are
+            inferred from dtype and cardinality.
 
         Returns
         -------
@@ -256,7 +262,9 @@ class CTGANModel(BaseModel):
         self._train_df = df.copy()
 
         # Schema & encoders
-        self.schema = infer_schema(df)
+        self.schema = infer_schema(
+            df, categorical_cols=categorical_cols, continuous_cols=continuous_cols
+        )
         fit_transformers(df, self.schema)
 
         backend = (self.cfg.get("backend") or "torch").lower()
@@ -291,17 +299,13 @@ class CTGANModel(BaseModel):
                 )
                 self._build_torch_networks(torch, nn)
 
-                # DataLoader
-                TensorDataset = data_utils.TensorDataset
-                DataLoader = data_utils.DataLoader
-                enc_t = torch.tensor(enc, dtype=torch.float32)
-                cond_t = torch.tensor(cond_full, dtype=torch.float32)
-                loader = DataLoader(
-                    TensorDataset(enc_t, cond_t),
-                    batch_size=self.cfg["batch_size"],
-                    shuffle=True,
-                    drop_last=True,
+                enc_t = torch.tensor(enc, dtype=torch.float32, device=self._device)
+                sampler = ConditionSampler(
+                    df, self.schema, self.cond_blocks, self.empirical_probs
                 )
+                rng = np.random.default_rng(self.cfg["seed"])
+                batch_size = int(self.cfg["batch_size"])
+                steps_per_epoch = max(1, len(df) // batch_size)
 
                 G = self.generator
                 D = self.discriminator
@@ -336,45 +340,54 @@ class CTGANModel(BaseModel):
                     ).mean() * lambda_gp
                     return gp
 
+                def _condition_loss(logits, col_idx, cat_idx):
+                    """Cross-entropy tying the output to the requested category."""
+                    total = logits.new_zeros(())
+                    for j, col in enumerate(sampler.cols):
+                        rows = torch.as_tensor(np.where(col_idx == j)[0]).to(
+                            logits.device
+                        )
+                        if rows.numel() == 0:
+                            continue
+                        start, end = self.cat_blocks[col.name]
+                        target = torch.as_tensor(cat_idx[col_idx == j]).to(
+                            logits.device
+                        )
+                        total = total + F.cross_entropy(
+                            logits[rows, start:end], target, reduction="sum"
+                        )
+                    return total / len(col_idx)
+
                 G.train()
                 D.train()
                 for _ in range(self.cfg["epochs"]):
-                    for real_batch, real_cond in loader:
-                        real_batch = real_batch.to(self._device)
-                        real_cond = real_cond.to(self._device)
-
+                    for _ in range(steps_per_epoch):
                         # n_critic steps
                         for _ in range(self.cfg["n_critic"]):
+                            cond_np, rows, _, _ = sampler.sample(batch_size, rng)
+                            cond_t = torch.tensor(
+                                cond_np, dtype=torch.float32, device=self._device
+                            )
+                            real_batch = enc_t[torch.as_tensor(rows).to(self._device)]
                             z = torch.randn(
-                                real_batch.size(0),
-                                self.cfg["noise_dim"],
-                                device=self._device,
-                            )
-                            cond_fake_np = sample_conditions(
-                                real_batch.size(0),
-                                self.schema,
-                                self.cond_blocks,
-                                self.empirical_probs,
-                            )
-                            cond_fake = torch.tensor(
-                                cond_fake_np, dtype=torch.float32, device=self._device
+                                batch_size, self.cfg["noise_dim"], device=self._device
                             )
                             fake_batch = self._forward_generator(
-                                torch, z, cond_fake
+                                torch, z, cond_t
                             ).detach()
 
                             d_real = self._forward_discriminator(
-                                torch, real_batch, real_cond
+                                torch, real_batch, cond_t
                             ).mean()
                             d_fake = self._forward_discriminator(
-                                torch, fake_batch, cond_fake
+                                torch, fake_batch, cond_t
                             ).mean()
                             if self.cfg["use_gradient_penalty"]:
                                 gp = _wgangp_gradient_penalty(
                                     D,
                                     real_batch,
                                     fake_batch,
-                                    cond_fake,
+                                    cond_t,
                                     self._device,
                                     self.cfg["lambda_gp"],
                                 )
@@ -391,24 +404,18 @@ class CTGANModel(BaseModel):
                                         -self.cfg["clip_value"], self.cfg["clip_value"]
                                     )
 
+                        cond_np, _, col_idx, cat_idx = sampler.sample(batch_size, rng)
+                        cond_t = torch.tensor(
+                            cond_np, dtype=torch.float32, device=self._device
+                        )
                         z = torch.randn(
-                            real_batch.size(0),
-                            self.cfg["noise_dim"],
-                            device=self._device,
+                            batch_size, self.cfg["noise_dim"], device=self._device
                         )
-                        cond_fake_np = sample_conditions(
-                            real_batch.size(0),
-                            self.schema,
-                            self.cond_blocks,
-                            self.empirical_probs,
-                        )
-                        cond_fake = torch.tensor(
-                            cond_fake_np, dtype=torch.float32, device=self._device
-                        )
-                        fake_batch = self._forward_generator(torch, z, cond_fake)
+                        logits = self.generator(torch.cat([z, cond_t], dim=1))
+                        fake_batch = self._gumbelize_cats(logits)
                         g_loss = -self._forward_discriminator(
-                            torch, fake_batch, cond_fake
-                        ).mean()
+                            torch, fake_batch, cond_t
+                        ).mean() + _condition_loss(logits, col_idx, cat_idx)
 
                         g_opt.zero_grad(set_to_none=True)
                         g_loss.backward()
@@ -427,6 +434,8 @@ class CTGANModel(BaseModel):
         *args,
         synthetic_dir: str | None = None,
         artifact_state_dir: str | None = None,
+        categorical_cols: list[str] | None = None,
+        continuous_cols: list[str] | None = None,
         **kwargs,
     ) -> CTGANModel:
         """
@@ -470,7 +479,7 @@ class CTGANModel(BaseModel):
             y_col = y.columns[0]
             df = pd.concat([X, y[y_col]], axis=1)
 
-        self.fit(df)
+        self.fit(df, categorical_cols=categorical_cols, continuous_cols=continuous_cols)
 
         # Save outputs
         synth_dir = synthetic_dir
